@@ -281,8 +281,7 @@ class Pool:
         sel.register(self.selector_recv_pipe, selectors.EVENT_READ, (closing, None))
 
         def receiving(_, child: Child):
-            if not child._closed:
-                child.flush()
+            child.flush()
 
         for c in self.children:
             sel.register(c.parent_conn, selectors.EVENT_READ, (receiving, c))
@@ -294,10 +293,11 @@ class Pool:
                 callback(key.fileobj, child)
 
         sel.close()
-        print('selector closed')
 
     def _terminate_selector(self):
-        self.selector_send_pipe.send_bytes(b'0')
+        if self.selector_thread.is_alive():
+            self.selector_send_pipe.send_bytes(b'0')
+            self.selector_thread.join()
 
     # prevent new tasks from being submitted
     # but keep existing tasks running
