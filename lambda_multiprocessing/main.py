@@ -1,5 +1,7 @@
 from multiprocessing import TimeoutError, Process, Pipe
 from multiprocessing.connection import Connection
+from threading import Thread
+import selectors
 from typing import Any, Iterable, List, Dict, Tuple, Union
 from uuid import uuid4, UUID
 import random
@@ -251,6 +253,9 @@ class Pool:
             # create one 'child' which will just do work in the main thread
             self.children = [Child(main_proc=True)]
 
+        self.selector_recv_pipe, self.selector_send_pipe = Pipe()
+        self.selector_thread = Thread(target=self._selector)
+        self.selector_thread.start()
 
     def __enter__(self):
         return self
@@ -262,6 +267,37 @@ class Pool:
 
     def __del__(self):
         self.terminate()
+
+    def _selector(self):
+        sel = selectors.DefaultSelector()
+        running = True
+
+        def closing(conn, _):
+            nonlocal running
+            running = False
+            conn.recv_bytes()
+            conn.close()
+
+        sel.register(self.selector_recv_pipe, selectors.EVENT_READ, (closing, None))
+
+        def receiving(_, child: Child):
+            if not child._closed:
+                child.flush()
+
+        for c in self.children:
+            sel.register(c.parent_conn, selectors.EVENT_READ, (receiving, c))
+
+        while running:
+            events = sel.select()
+            for key, _ in events:
+                callback, child = key.data
+                callback(key.fileobj, child)
+
+        sel.close()
+        print('selector closed')
+
+    def _terminate_selector(self):
+        self.selector_send_pipe.send_bytes(b'0')
 
     # prevent new tasks from being submitted
     # but keep existing tasks running
@@ -281,6 +317,7 @@ class Pool:
     def terminate(self):
         for c in self.children:
             c.terminate()
+        self._terminate_selector()
         self._closed |= True
 
     def apply(self, func, args=(), kwds=None):

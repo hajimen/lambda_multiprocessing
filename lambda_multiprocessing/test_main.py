@@ -457,5 +457,20 @@ class TestSlow(TestCase):
                 for j in range(10**2):
                     p.map(square, range(10**3))
 
+def pipe_blocking_func(_):
+    from time import sleep
+    sleep(0.2)
+    return [i for i in range(10000000)]
+
+class TestRaceCondition(TestCase):
+    def test_producer_consumer(self):
+        results_async = []
+        with Pool(1) as p:
+            for i in range(3):
+                results_async.append(p.apply_async(
+                    pipe_blocking_func,
+                    ([i for i in range(10000000)],)))
+        p.join()
+
 if __name__ == '__main__':
     unittest.main()
