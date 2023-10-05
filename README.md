@@ -1,3 +1,12 @@
+# Fork note
+
+Original codebase was unable to handle race condition with large objects.
+See `TestRaceCondition` in `lambda_multiprocessing/test_main.py`.
+
+To fix the problem, I need to use `select()`. I believe there is no other solution.
+But Windows cannot do on pipe. So now it uses socket instead of pipe.
+It may be too much for many cases. So I didn't send PR to original repo.
+
 # lambda_multiprocessing - Multiprocessing in AWS Lambda
 
 This library is for doing multiprocessing in AWS Lambda in python.

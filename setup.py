@@ -6,13 +6,13 @@ with open('README.md', 'r') as f:
 
 setup(
  name='lambda_multiprocessing',
- version='0.4',
+ version='0.5',
  description='drop-in replacement for multiprocessing.Pool in AWS Lambda functions (without /dev/shm shared memory)',
  long_description=long_description,
  long_description_content_type="text/markdown",
- url='https://github.com/mdavis-xyz/lambda_multiprocessing',
- author='Matthew Davis',
- author_email='github@mdavis.xyz',
+ url='https://github.com/hajimen/lambda_multiprocessing',
+ author=['Matthew Davis', 'Hajime Nakazato'],
+ author_email='hajime@kaoriha.org',
  classifiers=[
    'Development Status :: 3 - Alpha',
    'Intended Audience :: Developers',
