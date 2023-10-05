@@ -131,6 +131,7 @@ class Child:
         sp_left, sp_right = socket.socketpair()
         self.parent_conn = Connection(sp_left, recv_by_blocking=False)
         self.child_conn = Connection(sp_right, recv_by_blocking=True)
+        self.selector = None
         self.main_proc = main_proc
         if not main_proc:
             self.proc = Process(target=self.spin)
@@ -192,10 +193,7 @@ class Child:
     # should be idempotent
     def close(self):
         if not self._closed:
-            if not self.main_proc:
-                # send quit signal to child
-                self.parent_conn.send([None, True])
-            else:
+            if self.main_proc:
                 # no child process to close
                 self.flush()
                 self.child_conn.close()
@@ -209,7 +207,15 @@ class Child:
     # should be idempotent
     def join(self):
         assert self._closed, "Must close before joining"
+        if self.parent_conn.sock.fileno() == -1:  # already joined
+            return
         if not self.main_proc:
+            while self.queue_sz != 0:
+                self.flush()
+                sleep(0.1)
+            self.selector.unregister(self.parent_conn.sock)
+            # send quit signal to child
+            self.parent_conn.send([None, True])
             try:
                 self.proc.join()
             except ValueError as e:
@@ -378,6 +384,7 @@ class Pool:
 
         for c in self.children:
             sel.register(c.parent_conn.sock, selectors.EVENT_READ, (receiving, c.parent_conn, c))
+            c.selector = sel
 
         while running:
             events = sel.select()
