@@ -1,12 +1,105 @@
-from multiprocessing import TimeoutError, Process, Pipe
-from multiprocessing.connection import Connection
+from multiprocessing import TimeoutError, Process
 from threading import Thread
 import selectors
+import socket
 from typing import Any, Iterable, List, Dict, Tuple, Union
 from uuid import uuid4, UUID
 import random
 import os
-from time import time
+from time import time, sleep
+import pickle
+
+OBJ_SIZE_LENGTH = 8
+
+class Connection:
+    def __init__(self, sock: socket.socket, recv_by_blocking: bool) -> None:
+        self.recv_buf = bytes()
+        self.recv_next_size = 0
+        sock.setblocking(False)
+        self.sock = sock
+        self.closed = False
+        self.terminated = False
+        self.recv_by_blocking = recv_by_blocking
+
+    def read_socket(self):
+        try:
+            if self.terminated:
+                return
+            MAX = 1024 * 1024
+            while True:
+                buf = self.sock.recv(MAX)
+                self.recv_buf += buf
+                if len(buf) < MAX:  # not enough because len(buf) == MAX and nothing next can occur.
+                    return
+        except BlockingIOError:
+            pass
+
+    def _poll_size(self):
+        if self.recv_by_blocking:
+            self.read_socket()
+
+        if self.recv_next_size == 0:
+            if OBJ_SIZE_LENGTH > len(self.recv_buf):
+                return False
+            self.recv_next_size = int.from_bytes(self.recv_buf[:OBJ_SIZE_LENGTH])
+            self.recv_buf = self.recv_buf[OBJ_SIZE_LENGTH:]
+        return True
+
+    def recv(self):
+        if self.recv_by_blocking:
+            self.read_socket()
+
+        if self.recv_next_size == 0:
+            while OBJ_SIZE_LENGTH > len(self.recv_buf):
+                if self.recv_by_blocking:
+                    sleep(0.01)
+                    self.read_socket()
+                else:
+                    raise Exception()
+            self.recv_next_size = int.from_bytes(self.recv_buf[:OBJ_SIZE_LENGTH])
+            self.recv_buf = self.recv_buf[OBJ_SIZE_LENGTH:]
+        while self.recv_next_size > len(self.recv_buf):
+            if self.recv_by_blocking:
+                sleep(0.01)
+                self.read_socket()
+            else:
+                raise Exception()
+        obj = pickle.loads(self.recv_buf[:self.recv_next_size])
+        self.recv_buf = self.recv_buf[self.recv_next_size:]
+        self.recv_next_size = 0
+        return obj
+
+    def send(self, obj):
+        buf = pickle.dumps(obj)
+        obj_size_buf = len(buf).to_bytes(OBJ_SIZE_LENGTH)
+        send_buf = obj_size_buf + buf
+        self.sock.setblocking(True)
+        self.sock.sendall(send_buf)
+        self.sock.setblocking(False)
+
+    def send_bytes(self, buf):
+        self.sock.setblocking(True)
+        self.sock.sendall(buf)
+        self.sock.setblocking(False)
+
+    def poll(self, timeout=None):
+        before = time()
+        while True:
+            if self._poll_size() and self.recv_next_size <= len(self.recv_buf):
+                return True
+            if timeout is not None and time() - before > timeout:
+                break
+            sleep(0.01)
+        return self.recv_next_size != 0 and self.recv_next_size <= len(self.recv_buf)
+
+    def terminate(self):
+        if not self.terminated:
+            self.terminated = True
+            self.sock.shutdown(socket.SHUT_RDWR)
+            self.sock.close()
+
+    def close(self):
+        self.closed = True
 
 class Child:
     proc: Process
@@ -30,12 +123,14 @@ class Child:
 
     # if True, do the work in the main process
     # but present the same interface
-    # and still send stuff through the pipes (to verify they're pickleable)
+    # and still send stuff through the connections (to verify they're pickleable)
     # this is so we can unit test with moto
     main_proc: bool
 
     def __init__(self, main_proc=False):
-        self.parent_conn, self.child_conn = Pipe(duplex=True)
+        sp_left, sp_right = socket.socketpair()
+        self.parent_conn = Connection(sp_left, recv_by_blocking=False)
+        self.child_conn = Connection(sp_right, recv_by_blocking=True)
         self.main_proc = main_proc
         if not main_proc:
             self.proc = Process(target=self.spin)
@@ -44,10 +139,10 @@ class Child:
     # each child process runs in this
     # a while loop waiting for payloads from the self.child_conn
     # [(id, func, args, kwds), None] -> call func(args, *kwds)
-    #                         and send the return back through the self.child_conn pipe
+    #                         and send the return back through the self.child_conn connection
     #                         {id: (ret, None)} if func returned ret
     #                         {id: (None, err)} if func raised exception err
-    # [None, True] -> exit gracefully (write nothing to the pipe)
+    # [None, True] -> exit gracefully (write nothing to the connection)
     def spin(self) -> None:
         while True:
             (job, quit_signal) = self.child_conn.recv()
@@ -82,10 +177,10 @@ class Child:
         self.queue_sz += 1
         return AsyncResult(id=id, child=self)
 
-    # grab all results in the pipe from child to parent
+    # grab all results in the connection from child to parent
     # save them to self.result_cache
     def flush(self):
-        # watch out, when the other end is closed, a termination byte appears, so .poll() returns True
+        # watch out, when the other end is closed, obj size read, so .poll() returns True
         while (not self.parent_conn.closed) and (self.queue_sz > 0) and self.parent_conn.poll(0):
             result = self.parent_conn.recv()
             assert isinstance(list(result.keys())[0], UUID)
@@ -144,12 +239,11 @@ class Child:
                         self.proc.close()
                     except ValueError:
                         self.proc.terminate()
+        self.parent_conn.terminate()
         self.parent_conn.close()
+        self.child_conn.terminate()
         self.child_conn.close()
         self._closed |= True
-
-    def __del__(self):
-        self.terminate()
 
 
 class AsyncResult:
@@ -253,7 +347,9 @@ class Pool:
             # create one 'child' which will just do work in the main thread
             self.children = [Child(main_proc=True)]
 
-        self.selector_recv_pipe, self.selector_send_pipe = Pipe()
+        sp_left, sp_right = socket.socketpair()
+        self.selector_recv_conn = Connection(sp_left, recv_by_blocking=False)
+        self.selector_send_conn = Connection(sp_right, recv_by_blocking=False)
         self.selector_thread = Thread(target=self._selector)
         self.selector_thread.start()
 
@@ -265,39 +361,43 @@ class Pool:
         self.join()
         self.terminate()
 
-    def __del__(self):
-        self.terminate()
-
     def _selector(self):
         sel = selectors.DefaultSelector()
         running = True
 
-        def closing(conn, _):
+        def closing(conn: Connection, _):
             nonlocal running
             running = False
-            conn.recv_bytes()
+            conn.read_socket()
             conn.close()
 
-        sel.register(self.selector_recv_pipe, selectors.EVENT_READ, (closing, None))
+        sel.register(self.selector_recv_conn.sock, selectors.EVENT_READ, (closing, self.selector_recv_conn, None))
 
-        def receiving(_, child: Child):
-            child.flush()
+        def receiving(conn: Connection, child: Child):
+            conn.read_socket()
 
         for c in self.children:
-            sel.register(c.parent_conn, selectors.EVENT_READ, (receiving, c))
+            sel.register(c.parent_conn.sock, selectors.EVENT_READ, (receiving, c.parent_conn, c))
 
         while running:
             events = sel.select()
             for key, _ in events:
-                callback, child = key.data
-                callback(key.fileobj, child)
+                callback, conn, child = key.data
+                if conn.sock.fileno() == -1:
+                    sel.unregister(conn.sock)
+                    continue
+                callback(conn, child)
 
         sel.close()
 
     def _terminate_selector(self):
         if self.selector_thread.is_alive():
-            self.selector_send_pipe.send_bytes(b'0')
+            self.selector_send_conn.send_bytes(b'0')
             self.selector_thread.join()
+            self.selector_send_conn.terminate()
+            self.selector_send_conn.close()
+            self.selector_recv_conn.terminate()
+            self.selector_recv_conn.close()
 
     # prevent new tasks from being submitted
     # but keep existing tasks running
@@ -315,9 +415,9 @@ class Pool:
 
     # terminate child processes without waiting for them to finish
     def terminate(self):
+        self._terminate_selector()
         for c in self.children:
             c.terminate()
-        self._terminate_selector()
         self._closed |= True
 
     def apply(self, func, args=(), kwds=None):
