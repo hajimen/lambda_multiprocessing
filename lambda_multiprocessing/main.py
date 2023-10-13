@@ -216,23 +216,21 @@ class Child:
             self.selector.unregister(self.parent_conn.sock)
             # send quit signal to child
             self.parent_conn.send([None, True])
+        self.flush()
+
+    # terminate child processes without waiting for them to finish
+    # should be idempotent
+    def terminate(self):
+        if not self.main_proc:
             try:
                 self.proc.join()
-            except ValueError as e:
+            except ValueError:
                 # .join() has probably been called multiple times
                 # so the process has already been closed
                 pass
             finally:
                 self.proc.close()
 
-        self.flush()
-        self.parent_conn.close()
-
-
-    # terminate child processes without waiting for them to finish
-    # should be idempotent
-    def terminate(self):
-        if not self.main_proc:
             try:
                 a = self.proc.is_alive()
             except ValueError:
